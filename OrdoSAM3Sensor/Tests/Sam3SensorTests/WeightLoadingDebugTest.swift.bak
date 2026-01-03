@@ -1,0 +1,55 @@
+import XCTest
+import Metal
+@testable import Sam3Sensor
+
+@available(macOS 15.0, *)
+final class WeightLoadingDebugTest: XCTestCase {
+    
+    func testLoadWeightsStepByStep() throws {
+        print("\n=== Weight Loading Debug Test ===")
+        
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal device")
+            return
+        }
+        print("✅ Metal device: \(device.name)")
+        
+        let weightsPath = "/Users/kwilliams/Projects/Sam3/OrdoSAM3Sensor/Tests/Artifacts/sam3_weights.npz"
+        guard FileManager.default.fileExists(atPath: weightsPath) else {
+            throw XCTSkip("Weights not found at \(weightsPath)")
+        }
+        print("✅ Weights file exists")
+        
+        // Check for .wts file
+        let wtsPath = weightsPath.replacingOccurrences(of: ".npz", with: ".wts")
+        if FileManager.default.fileExists(atPath: wtsPath) {
+            print("✅ Packed weights (.wts) found")
+            
+            // Check file size
+            let attrs = try FileManager.default.attributesOfItem(atPath: wtsPath)
+            let fileSize = attrs[.size] as! UInt64
+            print("   Size: \(fileSize / 1024 / 1024)MB")
+        } else {
+            print("⚠️  No .wts file found")
+        }
+        
+        print("\n--- Creating SAM3Predictor ---")
+        let predictor = SAM3Predictor(device: device, enableHalfPrecision: true)
+        print("✅ Predictor created")
+        
+        print("\n--- Loading Weights ---")
+        let t0 = Date()
+        
+        do {
+            try predictor.loadWeights(from: URL(fileURLWithPath: weightsPath))
+            let elapsed = Date().timeIntervalSince(t0)
+            print("✅ Weights loaded in \(String(format: "%.2f", elapsed))s")
+        } catch {
+            print("❌ Weight loading failed: \(error)")
+            print("   Error type: \(type(of: error))")
+            throw error
+        }
+        
+        print("\n=== Weight Loading Complete ===\n")
+    }
+}

@@ -1,0 +1,181 @@
+import XCTest
+import Metal
+import CoreGraphics
+@testable import Sam3Sensor
+
+@available(macOS 15.0, *)
+final class EndToEndSAM3IntegrationTests: XCTestCase {
+    
+    var device: MTLDevice!
+    var predictor: SAM3Predictor!
+    
+    override func setUp() {
+        super.setUp()
+        guard let dev = MTLCreateSystemDefaultDevice() else {
+            XCTFail("Metal not available")
+            return
+        }
+        device = dev
+    }
+    
+    // MARK: - End-to-End Integration Test
+    
+    func testSAM3WithRealWeights() throws {
+        // Find weights file
+        let possiblePaths = [
+            "/Users/kwilliams/Projects/Sam3/OrdoSAM3Sensor/Tests/Artifacts/sam3_weights.npz",
+            "/Users/kwilliams/Projects/Sam3/OrdoSAM3Sensor/Tests/Artifacts/sam3_weights.npz",
+            "/Users/kwilliams/Downloads/sam3_full_weights.npz"
+        ]
+        
+        var weightsURL: URL?
+        for path in possiblePaths {
+            if FileManager.default.fileExists(atPath: path) {
+                weightsURL = URL(fileURLWithPath: path)
+                break
+            }
+        }
+        
+        guard let weightsPath = weightsURL else {
+            throw XCTSkip("SAM3 weights not found. Checked paths: \(possiblePaths)")
+        }
+        
+        print("Loading weights from: \(weightsPath.path)")
+        
+        // Create predictor
+        predictor = SAM3Predictor(device: device)
+        
+        // Load weights
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        try predictor.loadWeights(from: weightsPath)
+        let t1 = DispatchTime.now().uptimeNanoseconds
+        let loadTimeMs = Double(t1 - t0) / 1_000_000.0
+        print("Weights loaded in \(loadTimeMs)ms")
+        
+        // Create test image (1008x1008)
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: 1008,
+            height: 1008,
+            mipmapped: false
+        )
+        descriptor.usage = [.shaderRead, .shaderWrite]
+        descriptor.storageMode = .shared
+        
+        guard let texture = device.makeTexture(descriptor: descriptor) else {
+            XCTFail("Failed to create texture")
+            return
+        }
+        
+        // Fill with test pattern (simple gradient)
+        var data = [UInt8](repeating: 0, count: 1008 * 1008 * 4)
+        for y in 0..<1008 {
+            for x in 0..<1008 {
+                let idx = (y * 1008 + x) * 4
+                data[idx] = UInt8(x % 256)     // R
+                data[idx + 1] = UInt8(y % 256) // G
+                data[idx + 2] = 128            // B
+                data[idx + 3] = 255            // A
+            }
+        }
+        texture.replace(region: MTLRegionMake2D(0, 0, 1008, 1008), mipmapLevel: 0, withBytes: data, bytesPerRow: 1008 * 4)
+        
+        // Set image
+        let t2 = DispatchTime.now().uptimeNanoseconds
+        try predictor.setImage(texture)
+        let t3 = DispatchTime.now().uptimeNanoseconds
+        let encodeTimeMs = Double(t3 - t2) / 1_000_000.0
+        print("Image encoded in \(encodeTimeMs)ms")
+        
+        // Predict with point prompt
+        let point = CGPoint(x: 500, y: 500)
+        let t4 = DispatchTime.now().uptimeNanoseconds
+        let result = try predictor.predict(points: [point], labels: [1])
+        let t5 = DispatchTime.now().uptimeNanoseconds
+        let predictTimeMs = Double(t5 - t4) / 1_000_000.0
+        print("Prediction in \(predictTimeMs)ms")
+        
+        // Verify results
+        XCTAssertNotNil(result.masks)
+        XCTAssertEqual(result.masks.width, 288)
+        XCTAssertEqual(result.masks.height, 288)
+        XCTAssertEqual(result.masks.arrayLength, 4)
+        
+        // Check IoU scores
+        XCTAssertEqual(result.iouScores.count, 4)
+        print("IoU scores: \(result.iouScores)")
+        
+        // At least one mask should have decent confidence
+        let maxIoU = result.iouScores.max() ?? 0.0
+        print("Max IoU: \(maxIoU)")
+        XCTAssertGreaterThan(maxIoU, 0.5, "IoU too low - model may not be working correctly")
+        
+        // Print performance summary
+        print("\n=== SAM3 Performance Summary ===")
+        print("Weight loading: \(String(format: "%.1f", loadTimeMs))ms")
+        print("Image encoding: \(String(format: "%.1f", encodeTimeMs))ms")
+        print("Prediction: \(String(format: "%.1f", predictTimeMs))ms")
+        print("Total: \(String(format: "%.1f", loadTimeMs + encodeTimeMs + predictTimeMs))ms")
+        print("Max IoU: \(String(format: "%.3f", maxIoU))")
+        print("================================\n")
+    }
+    
+    // MARK: - Performance Baseline Test
+    
+    func testSAM3PerformanceBaseline() throws {
+        // This test establishes performance baselines
+        // Skip if weights not available
+        let weightsPath = "/Users/kwilliams/Projects/Sam3/OrdoSAM3Sensor/Tests/Artifacts/sam3_weights.npz"
+        guard FileManager.default.fileExists(atPath: weightsPath) else {
+            throw XCTSkip("Weights not found")
+        }
+        
+        predictor = SAM3Predictor(device: device)
+        try predictor.loadWeights(from: URL(fileURLWithPath: weightsPath))
+        
+        // Create test texture
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: 1008,
+            height: 1008,
+            mipmapped: false
+        )
+        descriptor.usage = [.shaderRead, .shaderWrite]
+        descriptor.storageMode = .shared
+        let texture = device.makeTexture(descriptor: descriptor)!
+        
+        // Warm up
+        try predictor.setImage(texture)
+        _ = try predictor.predict(points: [CGPoint(x: 500, y: 500)], labels: [1])
+        
+        // Measure multiple runs
+        var encodeTimes: [Double] = []
+        var predictTimes: [Double] = []
+        
+        for _ in 0..<5 {
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            try predictor.setImage(texture)
+            let t1 = DispatchTime.now().uptimeNanoseconds
+            encodeTimes.append(Double(t1 - t0) / 1_000_000.0)
+            
+            let t2 = DispatchTime.now().uptimeNanoseconds
+            _ = try predictor.predict(points: [CGPoint(x: 500, y: 500)], labels: [1])
+            let t3 = DispatchTime.now().uptimeNanoseconds
+            predictTimes.append(Double(t3 - t2) / 1_000_000.0)
+        }
+        
+        let avgEncode = encodeTimes.reduce(0, +) / Double(encodeTimes.count)
+        let avgPredict = predictTimes.reduce(0, +) / Double(predictTimes.count)
+        
+        print("\n=== Performance Baseline (5 runs) ===")
+        print("Avg encoding: \(String(format: "%.1f", avgEncode))ms")
+        print("Avg prediction: \(String(format: "%.1f", avgPredict))ms")
+        print("Total per frame: \(String(format: "%.1f", avgEncode + avgPredict))ms")
+        print("=====================================\n")
+        
+        // Baseline targets (these will vary by hardware)
+        // Just verify it completes in reasonable time
+        XCTAssertLessThan(avgEncode, 5000.0, "Encoding too slow")
+        XCTAssertLessThan(avgPredict, 1000.0, "Prediction too slow")
+    }
+}

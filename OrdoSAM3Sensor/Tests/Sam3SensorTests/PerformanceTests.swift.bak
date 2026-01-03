@@ -1,0 +1,43 @@
+
+import XCTest
+import Metal
+import Sam3Sensor
+
+@available(macOS 15.0, *)
+final class PerformanceTests: XCTestCase {
+     func testEncoderThroughput() throws {
+        let device = MTLCreateSystemDefaultDevice()!
+        let predictor = SAM3Predictor(device: device)
+        let weightsPath = "/Users/kwilliams/Projects/ordo_bak/Sensors/sam3_full_weights.npz"
+        let testImagePath = "/Users/kwilliams/Projects/ordo_bak/Sensors/research/sam3/assets/images/truck.jpg"
+        
+        try predictor.loadWeights(from: URL(fileURLWithPath: weightsPath))
+        
+        // Mock texture (real texture load for accuracy)
+        let texture = loadTexture(at: URL(fileURLWithPath: testImagePath), device: device)!
+        
+        print("\n🚀 Starting Performance Burst (5 iterations)...")
+        for i in 1...5 {
+            let start = Date()
+            try predictor.setImage(texture)
+            let elapsed = Date().timeIntervalSince(start)
+            print("   Iteration \(i): \(String(format: "%.3f", elapsed))s")
+        }
+    }
+    
+    // Helper: Load/Resize to 1008x1008 Texture (Simplified copy from E2E)
+    func loadTexture(at url: URL, device: MTLDevice) -> MTLTexture? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        let width = 1008
+        let height = 1008
+        let bytesPerRow = width * 4
+        var rawData = [UInt8](repeating: 0, count: height * bytesPerRow)
+        let context = CGContext(data: &rawData, width: width, height: height, bitsPerComponent: 8, bytesPerRow: bytesPerRow, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue)
+        context?.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: width, height: height, mipmapped: false)
+        let texture = device.makeTexture(descriptor: desc)!
+        texture.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0, withBytes: rawData, bytesPerRow: bytesPerRow)
+        return texture
+    }
+}

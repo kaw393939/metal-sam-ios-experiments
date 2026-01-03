@@ -1,0 +1,133 @@
+import XCTest
+import Metal
+@testable import Sam3Sensor
+
+/// Gate A: Weight Loading Tests
+/// These tests verify that SAM3 weights can be loaded correctly from NPZ format.
+final class WeightLoadingTests: XCTestCase {
+    
+    static let weightsPath = "/Users/kwilliams/Projects/ordo/Sensors/SAM3Metal/Tests/Artifacts/sam3_weights.npz"
+    var device: MTLDevice!
+    
+    override func setUpWithError() throws {
+        device = MTLCreateSystemDefaultDevice()
+        guard device != nil else {
+            throw XCTSkip("Metal device not available")
+        }
+        
+        // Skip if weights file doesn't exist
+        guard FileManager.default.fileExists(atPath: Self.weightsPath) else {
+            throw XCTSkip("SAM3 weights file not found at \(Self.weightsPath)")
+        }
+    }
+    
+    // MARK: - NPZ Loading Tests
+    
+    /// Test 1.1: Load all 1102 weight tensors from NPZ
+    func testLoadAllWeights() throws {
+        let loader = ModelLoader()
+        let weights = try loader.load(url: URL(fileURLWithPath: Self.weightsPath))
+        
+        // SAM3 checkpoint has exactly 1102 weight tensors
+        XCTAssertEqual(weights.count, 1102, "Expected 1102 weight tensors, got \(weights.count)")
+    }
+    
+    /// Test 1.2: Verify encoder block 0 norm1 weight exists and has correct shape
+    func testEncoderBlock0Norm1Weight() throws {
+        let loader = ModelLoader()
+        let weights = try loader.load(url: URL(fileURLWithPath: Self.weightsPath))
+        
+        let key = "backbone.vision_backbone.trunk.blocks.0.norm1.weight"
+        guard let data = weights[key] else {
+            XCTFail("Weight key '\(key)' not found")
+            return
+        }
+        
+        // norm1.weight should be [1024] floats = 4096 bytes
+        let expectedBytes = 1024 * 4
+        XCTAssertEqual(data.count, expectedBytes, "norm1.weight should be \(expectedBytes) bytes, got \(data.count)")
+    }
+    
+    /// Test 1.3: Verify attention QKV weight is fused [3072, 1024]
+    func testEncoderBlock0AttentionQKV() throws {
+        let loader = ModelLoader()
+        let weights = try loader.load(url: URL(fileURLWithPath: Self.weightsPath))
+        
+        let key = "backbone.vision_backbone.trunk.blocks.0.attn.qkv.weight"
+        guard let data = weights[key] else {
+            XCTFail("Weight key '\(key)' not found")
+            return
+        }
+        
+        // qkv.weight should be [3072, 1024] = 3072 * 1024 * 4 bytes
+        let expectedBytes = 3072 * 1024 * 4
+        XCTAssertEqual(data.count, expectedBytes, "attn.qkv.weight should be \(expectedBytes) bytes, got \(data.count)")
+    }
+    
+    /// Test 1.4: Verify MLP fc1 has correct hidden dimension
+    func testEncoderBlock0MLPDimension() throws {
+        let loader = ModelLoader()
+        let weights = try loader.load(url: URL(fileURLWithPath: Self.weightsPath))
+        
+        let key = "backbone.vision_backbone.trunk.blocks.0.mlp.fc1.weight"
+        guard let data = weights[key] else {
+            XCTFail("Weight key '\(key)' not found")
+            return
+        }
+        
+        // fc1.weight should be [4736, 1024] = 4736 * 1024 * 4 bytes
+        // Hidden dim is 4736 (4.625 × 1024), not 4 × 1024
+        let expectedBytes = 4736 * 1024 * 4
+        XCTAssertEqual(data.count, expectedBytes, "mlp.fc1.weight should be \(expectedBytes) bytes, got \(data.count)")
+    }
+    
+    /// Test 1.5: Verify key categories are present
+    func testWeightKeyCategories() throws {
+        let loader = ModelLoader()
+        let weights = try loader.load(url: URL(fileURLWithPath: Self.weightsPath))
+        
+        let keys = Array(weights.keys)
+        
+        // Check for backbone (encoder) keys
+        let backboneKeys = keys.filter { $0.hasPrefix("backbone.") }
+        XCTAssertGreaterThan(backboneKeys.count, 700, "Expected >700 backbone keys")
+        
+        // Check for geometry encoder keys (prompt encoder)
+        let geometryKeys = keys.filter { $0.hasPrefix("geometry_encoder.") }
+        XCTAssertGreaterThan(geometryKeys.count, 30, "Expected >30 geometry_encoder keys")
+        
+        // Check for segmentation head keys
+        let segmentationKeys = keys.filter { $0.hasPrefix("segmentation_head.") }
+        XCTAssertGreaterThan(segmentationKeys.count, 10, "Expected >10 segmentation_head keys")
+        
+        // Check for transformer keys
+        let transformerKeys = keys.filter { $0.hasPrefix("transformer.") }
+        XCTAssertGreaterThan(transformerKeys.count, 0, "Expected transformer keys")
+        
+        print("Weight categories: backbone=\(backboneKeys.count), geometry=\(geometryKeys.count), segmentation=\(segmentationKeys.count), transformer=\(transformerKeys.count)")
+    }
+    
+    // MARK: - Buffer Conversion Tests
+    
+    /// Test that weights can be converted to MTLBuffer
+    func testWeightToBuffer() throws {
+        let loader = ModelLoader()
+        let weights = try loader.load(url: URL(fileURLWithPath: Self.weightsPath))
+        
+        let key = "backbone.vision_backbone.trunk.blocks.0.norm1.weight"
+        guard let buffer = weights.buffer(for: key, device: device) else {
+            XCTFail("Failed to create MTLBuffer for '\(key)'")
+            return
+        }
+        
+        XCTAssertEqual(buffer.length, 1024 * 4, "Buffer length mismatch")
+        
+        // Verify non-zero content
+        let ptr = buffer.contents().assumingMemoryBound(to: Float.self)
+        var nonZero = 0
+        for i in 0..<1024 {
+            if ptr[i] != 0.0 { nonZero += 1 }
+        }
+        XCTAssertGreaterThan(nonZero, 500, "Expected most values to be non-zero")
+    }
+}

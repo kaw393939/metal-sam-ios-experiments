@@ -1,0 +1,108 @@
+
+import XCTest
+import MetalPerformanceShadersGraph
+import MetalPerformanceShaders
+@testable import Sam3Sensor
+
+@available(macOS 15.0, *)
+final class MaskDecoderIsolationTests: XCTestCase {
+    
+    // Helper to load raw binary float32
+    func loadBin(_ path: String) throws -> [Float] {
+        let url = URL(fileURLWithPath: path)
+        let data = try Data(contentsOf: url)
+        return data.withUnsafeBytes {
+            Array(UnsafeBufferPointer(start: $0.bindMemory(to: Float.self).baseAddress!, count: data.count/4))
+        }
+    }
+    
+    func testDeepNumericalAudit() throws {
+        // Paths to generated "Golden" tensors
+        let root = "/Users/kwilliams/Projects/ordo_bak/Sensors/OrdoSAM3Sensor/Tests/Artifacts/"
+        let embedPath = root + "debug_img_embed.bin"
+        let posPath = root + "debug_pos_enc.bin"
+        let sparsePath = root + "debug_sparse.bin"
+        let densePath = root + "debug_dense.bin"
+        let maskPath = root + "debug_masks.bin"
+        let iouPath = root + "debug_iou.bin"
+        let s0Path = root + "debug_feat_s0.bin"
+        let s1Path = root + "debug_feat_s1.bin"
+        
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: embedPath) else {
+            print("Skipping audit: Reference binaries not found. Run python script first.")
+            return
+        }
+        
+        // Load Data
+        print("Loading Reference Tensors...")
+        let embedData = try loadBin(embedPath)
+        let posData = try loadBin(posPath)
+        let sparseData = try loadBin(sparsePath)
+        let denseData = try loadBin(densePath)
+        let refMasks = try loadBin(maskPath)
+        let refIoU = try loadBin(iouPath)
+        
+        let s0Data = try loadBin(s0Path)
+        let s1Data = try loadBin(s1Path)
+        
+        // Setup Device
+        guard let device = MTLCreateSystemDefaultDevice() else { fatalError("No Metal") }
+        let predictor = SAM3Predictor(device: device)
+        
+        // Load Weights
+        let weightsUrl = URL(fileURLWithPath: "/Users/kwilliams/Projects/ordo/Sensors/sam3_full_weights.npz")
+        try predictor.loadWeights(from: weightsUrl)
+        print("Weights Loaded.")
+        
+        // Create Buffers
+        func makeBuf(_ floats: [Float]) -> MTLBuffer {
+            return device.makeBuffer(bytes: floats, length: floats.count * 4, options: .storageModeShared)!
+        }
+        
+        let embedBuf = makeBuf(embedData)
+        let posBuf = makeBuf(posData)
+        let sparseBuf = makeBuf(sparseData)
+        let denseBuf = makeBuf(denseData)
+        let s0Buf = makeBuf(s0Data)
+        let s1Buf = makeBuf(s1Data)
+        
+        // Run Forward
+        print("Running Forward...")
+        let (outMasks, outIoU) = try predictor.maskDecoder.forward(
+            imageEmbeddings: embedBuf,
+            imagePE: posBuf,
+            pointEmbeddings: sparseBuf,
+            densePromptEmbeddings: denseBuf,
+            highResS0: s0Buf,
+            highResS1: s1Buf
+        )
+        
+        // Compare IoU
+        let ptr = outIoU.contents().bindMemory(to: Float.self, capacity: refIoU.count)
+        var metIoU = [Float](repeating: 0, count: 4)
+        for i in 0..<4 { metIoU[i] = ptr[i] }
+        
+        // Compare IoU (Metal has 4, Ref has 3)
+        // Metal 0 is single mask. Metal 1..3 are multimask.
+        // Ref is multimask (3) and has sigmoid applied.
+        func sigmoid(_ x: Float) -> Float {
+            return 1.0 / (1.0 + exp(-x))
+        }
+        
+        for i in 0..<3 {
+            let refVal = refIoU[i]
+            let metVal = sigmoid(metIoU[i + 1]) // Apply sigmoid and offset by 1
+            print("IoU[\(i)] Ref: \(refVal), Met: \(metVal)")
+            
+            let diff = abs(refVal - metVal)
+            print("IoU[\(i)] Diff: \(diff)")
+            
+            // Allow larger tolerance due to float32 accumulation diffs
+            XCTAssertLessThan(diff, 1e-3, "IoU[\(i)] mismatch")
+        }
+        
+        // Check Masks?
+        // ...
+    }
+}

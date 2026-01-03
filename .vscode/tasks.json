@@ -1,0 +1,52 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Ordo: Export veval toy masks (RLE→PNG)",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": [
+        "${workspaceFolder}/OrdoSAM3Sensor/scripts/python_extraction/export_veval_rle_to_png.py",
+        "--gt",
+        "${workspaceFolder}/research/sam3/assets/veval/toy_gt_and_pred/toy_saco_veval_sav_test_gt.json",
+        "--pred",
+        "${workspaceFolder}/research/sam3/assets/veval/toy_gt_and_pred/toy_saco_veval_sav_test_pred.json",
+        "--gt-out",
+        "/tmp/veval_export/gt",
+        "--pred-out",
+        "/tmp/veval_export/pred"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "Ordo: Eval IoU (toy veval PNGs)",
+      "type": "shell",
+      "command": "swift",
+      "args": [
+        "run",
+        "-q",
+        "OrdoCli",
+        "eval-iou",
+        "--pred",
+        "/tmp/veval_export/pred",
+        "--gt",
+        "/tmp/veval_export/gt",
+        "--threshold",
+        "128"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/OrdoSAM3Sensor"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Ordo: IoU (toy) export + eval",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "Ordo: Export veval toy masks (RLE→PNG)",
+        "Ordo: Eval IoU (toy veval PNGs)"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}

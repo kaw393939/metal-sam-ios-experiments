@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Sam3}/OrdoSAM3Sensor",
+            "name": "Debug OrdoCli (OrdoSAM3Sensor)",
+            "target": "OrdoCli",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug OrdoCli (OrdoSAM3Sensor)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Sam3}/OrdoSAM3Sensor",
+            "name": "Release OrdoCli (OrdoSAM3Sensor)",
+            "target": "OrdoCli",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release OrdoCli (OrdoSAM3Sensor)"
+        }
+    ]
+}

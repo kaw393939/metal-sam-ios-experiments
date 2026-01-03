@@ -1,0 +1,53 @@
+# MacOS
+.DS_Store
+
+# Git
+.git/
+
+# Swift / Xcode / SPM
+.build/
+.swiftpm/
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+Package.resolved
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Model Files & Weights (Large)
+checkpoints/
+*.safetensors
+*.pt
+*.mlpackage
+*.mlmodelc
+*.metallib
+*.bin
+*.npz
+*.npy
+
+# Research & Runs
+runs/
+research/
+
+# Logs & Temporal Files
+*.log
+*.txt
+build_output*.txt
+test_output*.txt
+run_log*.txt
+ane_benchmark_results.txt
+bench_output.txt
+
+# Local Config
+.env

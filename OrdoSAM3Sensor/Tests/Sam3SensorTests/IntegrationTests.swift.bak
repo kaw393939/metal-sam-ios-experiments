@@ -1,0 +1,108 @@
+import XCTest
+import Metal
+import MetalKit
+@testable import Sam3Sensor
+
+@available(macOS 15.0, *)
+final class IntegrationTests: XCTestCase {
+    var device: MTLDevice!
+    var predictor: SAM3Predictor!
+    
+    override func setUpWithError() throws {
+        device = MTLCreateSystemDefaultDevice()
+        if device == nil {
+            throw XCTSkip("Metal device not available")
+        }
+        predictor = SAM3Predictor(device: device)
+    }
+    
+    func testEndToEndPipeline() throws {
+        // 1. Create Dummy Image
+        let width = 1008
+        let height = 1008
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: width, height: height, mipmapped: false)
+        desc.usage = [.shaderRead, .shaderWrite]
+        guard let texture = device.makeTexture(descriptor: desc) else {
+            XCTFail("Failed to create input texture")
+            return
+        }
+        
+        // Fill with random data
+        let region = MTLRegionMake2D(0, 0, width, height)
+        let count = width * height * 4
+        var bytes = [UInt8](repeating: 0, count: count)
+        // naive fill
+        for i in 0..<1000 { bytes[i] = UInt8.random(in: 0...255) }
+        texture.replace(region: region, mipmapLevel: 0, withBytes: bytes, bytesPerRow: width * 4)
+        
+        // 2. Set Image (Run Encoder)
+        // This runs the heavy ViT
+        // For testing, update task boundary to expect long run
+        print("TEST: Running setImage...")
+        try predictor.setImage(texture)
+        
+        // 3. Predict (Run Decoder)
+        print("TEST: Running predict...")
+        let points = [CGPoint(x: 504, y: 504)]
+        let labels = [1]
+        
+        let result = try predictor.predict(points: points, labels: labels)
+        
+        // 4. Verify
+        XCTAssertNotNil(result.masks)
+        XCTAssertEqual(result.masks.width, 288)
+        XCTAssertEqual(result.masks.height, 288)
+        XCTAssertEqual(result.masks.arrayLength, 4)
+        
+        XCTAssertEqual(result.iouScores.count, 4)
+        print("TEST: IoU Scores: \(result.iouScores)")
+        
+        // Check if any output is not zero (random weights might produce garbage but non-zero)
+        // Read back some mask values to verify non-zero output
+        var maskPixels = [Float](repeating: 0, count: 256)
+        let sampleRegion = MTLRegionMake2D(0, 0, 16, 16) // Sample 16x16 corner
+        result.masks.getBytes(&maskPixels, bytesPerRow: 16 * 4, bytesPerImage: 0, from: sampleRegion, mipmapLevel: 0, slice: 0)
+        
+        let nonZeroMaskCount = maskPixels.filter { $0 != 0.0 }.count
+        let hasNonZeroMasks = nonZeroMaskCount > 0
+        let hasNonZeroIoU = result.iouScores.contains { $0 != 0.0 }
+        
+        print("TEST: Non-zero mask pixels (sample): \(nonZeroMaskCount)/\(maskPixels.count)")
+        print("TEST: First 10 mask values: \(Array(maskPixels.prefix(10)))")
+        print("TEST: Has non-zero masks: \(hasNonZeroMasks), Has non-zero IoU: \(hasNonZeroIoU)")
+        
+        // With random weights, we expect SOME non-zero output
+        // If all outputs are zero, there's likely a bug in the pipeline
+        XCTAssertTrue(hasNonZeroMasks || hasNonZeroIoU, "Pipeline produced all-zero outputs - this indicates a bug")
+    }
+    
+    /// Test with real SAM3 weights loaded from NPZ file
+    func testRealWeights() throws {
+        // Path to real weights
+        let weightsPath = "/Users/kwilliams/Projects/ordo/Sensors/SAM3Metal/Tests/Artifacts/sam3_weights.npz"
+        let weightsURL = URL(fileURLWithPath: weightsPath)
+        
+        guard FileManager.default.fileExists(atPath: weightsPath) else {
+            throw XCTSkip("SAM3 weights file not found at \(weightsPath)")
+        }
+        
+        // Load weights
+        print("TEST: Loading real SAM3 weights...")
+        let loader = ModelLoader()
+        let weights = try loader.load(url: weightsURL)
+        print("TEST: Loaded \(weights.count) weight tensors")
+        
+        // Check that we loaded a reasonable number of weights
+        XCTAssertGreaterThan(weights.count, 100, "Expected to load more than 100 weight tensors")
+        
+        // Print some key weights to verify
+        let encoderKeys = weights.keys.filter { $0.contains("backbone") }
+        let decoderKeys = weights.keys.filter { $0.contains("segmentation") || $0.contains("dot_prod") }
+        print("TEST: Encoder-related keys: \(encoderKeys.count)")
+        print("TEST: Decoder-related keys: \(decoderKeys.count)")
+        
+        // TODO: Apply weights to predictor and run inference
+        // For now, just verify weights loaded successfully
+        XCTAssertGreaterThan(encoderKeys.count, 0, "Expected encoder weights")
+    }
+}

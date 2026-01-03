@@ -1,0 +1,15 @@
+import XCTest
+import Metal
+@testable import Sam3Sensor
+
+@available(macOS 15.0, *)
+final class WeightInspector: XCTestCase {
+    func testInspectMemoryWeights() throws {
+        let device = MTLCreateSystemDefaultDevice()!
+        let predictor = SAM3Predictor(device: device)
+        let weightsPath = "/Users/kwilliams/Projects/ordo_bak/Sensors/sam3_full_weights.npz"
+        
+        // This will trigger the print loop I am about to add to SAM3Predictor
+        try predictor.loadWeights(from: URL(fileURLWithPath: weightsPath))
+    }
+}

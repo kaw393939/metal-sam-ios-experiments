@@ -1,0 +1,34 @@
+# MacOS
+.DS_Store
+
+# Swift / Xcode
+.build/
+.swiftpm/
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Artifacts & data
+*.bin
+*.npz
+*.npy
+test_output*.txt
+runs/
+artifacts/
+*.log
+
+# Local Config
+.env

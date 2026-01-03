@@ -1,0 +1,645 @@
+//
+//  OptimizationBaselineTests.swift
+//  Sam3SensorTests
+//
+//  TDD Baseline for performance optimization.
+//  This file captures:
+//  1. Performance baselines for each component
+//  2. Deterministic output checksums to verify correctness after optimizations
+//  3. Regression tests to ensure optimizations don't break functionality
+//
+
+import XCTest
+import Metal
+import MetalPerformanceShaders
+import MetalPerformanceShadersGraph
+import CryptoKit
+@testable import Sam3Sensor
+
+// MARK: - Test Configuration
+
+struct OptimizationBaseline {
+    /// Baseline timings (ms) - update these as optimizations improve
+    static let viTEncoderTarget: Double = 170.0      // Target: <170ms
+    static let maskDecoderTarget: Double = 50.0      // Target: <50ms
+    static let twoWayTransformerTarget: Double = 20.0 // Target: <20ms
+    static let fullPipelineTarget: Double = 250.0    // Target: <250ms (encoder + decoder + tracker)
+
+    /// Regression thresholds (ms) - fail if slower than this
+    static let viTEncoderRegression: Double = 200.0
+    static let maskDecoderRegression: Double = 100.0
+    static let twoWayTransformerRegression: Double = 50.0
+}
+
+// MARK: - Checksum Utilities
+
+extension Data {
+    var sha256Hex: String {
+        let hash = SHA256.hash(data: self)
+        return hash.compactMap { String(format: "%02x", $0) }.joined()
+    }
+}
+
+extension MTLBuffer {
+    /// Compute SHA256 checksum of buffer contents
+    func checksum() -> String {
+        let ptr = contents().bindMemory(to: UInt8.self, capacity: length)
+        let data = Data(bytes: ptr, count: length)
+        return data.sha256Hex
+    }
+
+    /// Get first N float values for debugging
+    func firstFloats(_ n: Int) -> [Float] {
+        let ptr = contents().bindMemory(to: Float.self, capacity: length / 4)
+        let count = min(n, length / 4)
+        return Array(UnsafeBufferPointer(start: ptr, count: count))
+    }
+
+    /// Get first N float16 values for debugging
+    func firstFloat16s(_ n: Int) -> [Float] {
+        let ptr = contents().bindMemory(to: Float16.self, capacity: length / 2)
+        let count = min(n, length / 2)
+        return UnsafeBufferPointer(start: ptr, count: count).map { Float($0) }
+    }
+}
+
+// MARK: - Baseline Tests
+
+final class OptimizationBaselineTests: XCTestCase {
+    var device: MTLDevice!
+    var commandQueue: MTLCommandQueue!
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        guard #available(macOS 15.0, *) else {
+            throw XCTSkip("Requires macOS 15.0+ (ViTEncoder/MPSGraph)")
+        }
+        guard let d = MTLCreateSystemDefaultDevice() else {
+            XCTFail("Metal device not supported")
+            return
+        }
+        device = d
+        commandQueue = device.makeCommandQueue()
+
+        // Clear caches for clean baseline
+        CompiledGraphCache.shared.clear()
+    }
+
+    override func tearDown() {
+        device = nil
+        commandQueue = nil
+        super.tearDown()
+    }
+
+    // MARK: - ViTEncoder Baseline
+
+    func testViTEncoderBaseline() throws {
+        print("\n" + String(repeating: "=", count: 60))
+        print("ViTEncoder Performance Baseline")
+        guard #available(macOS 15.0, *) else {
+            throw XCTSkip("Requires macOS 15.0+ (ViTEncoder/MPSGraph)")
+        }
+        print(String(repeating: "=", count: 60))
+
+        // Initialize encoder
+        let encoder = try ViTEncoder(device: device, numBlocks: 24)
+
+        // Create test input (1024x1024 RGBA16F)
+        let inputTexture = createTestTexture(width: 1024, height: 1024, seed: 42)
+
+        // Warmup (3 iterations)
+        print("Warmup...")
+        for _ in 0..<3 {
+            let cmd = commandQueue.makeCommandBuffer()!
+            _ = encoder.forward(image: inputTexture, commandBuffer: cmd)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+        }
+
+        // Benchmark (10 iterations)
+        let iterations = 10
+        print("Benchmarking \(iterations) iterations...")
+
+        var times: [Double] = []
+        var lastChecksum: String = ""
+
+        for i in 0..<iterations {
+            let cmd = commandQueue.makeCommandBuffer()!
+
+            let start = CFAbsoluteTimeGetCurrent()
+            let output = encoder.forward(image: inputTexture, commandBuffer: cmd)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
+
+            times.append(elapsed)
+
+            // Capture checksum on first iteration
+            if i == 0 {
+                lastChecksum = output.checksum()
+                print("  Output checksum: \(lastChecksum.prefix(16))...")
+                print("  Output shape: \(output.length) bytes")
+                print("  First 4 values: \(output.firstFloat16s(4))")
+            }
+
+            // Verify determinism
+            let checksum = output.checksum()
+            XCTAssertEqual(checksum, lastChecksum, "Non-deterministic output at iteration \(i)")
+        }
+
+        // Statistics
+        let avg = times.reduce(0, +) / Double(times.count)
+        let sorted = times.sorted()
+        let median = sorted[sorted.count / 2]
+        let min = sorted.first!
+        let max = sorted.last!
+        let stdDev = sqrt(times.map { pow($0 - avg, 2) }.reduce(0, +) / Double(times.count))
+
+        print("\n📊 ViTEncoder Results:")
+        print("  Average: \(String(format: "%.2f", avg)) ms")
+        print("  Median:  \(String(format: "%.2f", median)) ms")
+        print("  Min:     \(String(format: "%.2f", min)) ms")
+        print("  Max:     \(String(format: "%.2f", max)) ms")
+        print("  StdDev:  \(String(format: "%.2f", stdDev)) ms")
+        print("  Target:  \(OptimizationBaseline.viTEncoderTarget) ms")
+
+        if avg <= OptimizationBaseline.viTEncoderTarget {
+            print("  ✅ TARGET MET")
+        } else {
+            print("  ⚠️ TARGET MISSED by \(String(format: "%.1f", avg - OptimizationBaseline.viTEncoderTarget)) ms")
+        }
+
+        // Regression check
+        XCTAssertLessThan(avg, OptimizationBaseline.viTEncoderRegression,
+                         "Performance regression: ViTEncoder exceeded \(OptimizationBaseline.viTEncoderRegression)ms")
+
+        // Store baseline for comparison
+        print("\nBaseline checksum (save this): \(lastChecksum)")
+    }
+
+    // MARK: - MaskDecoder Baseline
+
+    func testMaskDecoderBaseline() throws {
+        print("\n" + String(repeating: "=", count: 60))
+        print("MaskDecoder Performance Baseline")
+        guard #available(macOS 15.0, *) else {
+            throw XCTSkip("Requires macOS 15.0+ (ViTEncoder/MPSGraph)")
+        }
+        print(String(repeating: "=", count: 60))
+
+        let decoder = MaskDecoder(device: device, embedDim: 256, numMultimaskOutputs: 3)
+
+        // Create test inputs
+        let imageEmb = createTestBuffer(count: 1 * 5184 * 256, seed: 42)      // [1, 5184, 256]
+        let imagePE = createTestBuffer(count: 1 * 5184 * 256, seed: 43)       // [1, 5184, 256]
+        let pointEmb = createTestBuffer(count: 1 * 2 * 256, seed: 44)         // [1, 2, 256]
+        let highResS0 = createTestBuffer(count: 1 * 288 * 288 * 256, seed: 45) // [1, 288, 288, 256]
+        let highResS1 = createTestBuffer(count: 1 * 144 * 144 * 256, seed: 46) // [1, 144, 144, 256]
+
+        // Warmup
+        print("Warmup...")
+        for _ in 0..<3 {
+            _ = try? decoder.forward(
+                imageEmbeddings: imageEmb,
+                imagePE: imagePE,
+                pointEmbeddings: pointEmb,
+                densePromptEmbeddings: nil,
+                highResS0: highResS0,
+                highResS1: highResS1
+            )
+        }
+
+        // Benchmark
+        let iterations = 10
+        print("Benchmarking \(iterations) iterations...")
+
+        var times: [Double] = []
+        var lastMaskChecksum: String = ""
+        var lastIoUChecksum: String = ""
+
+        for i in 0..<iterations {
+            let start = CFAbsoluteTimeGetCurrent()
+            let result = try decoder.forward(
+                imageEmbeddings: imageEmb,
+                imagePE: imagePE,
+                pointEmbeddings: pointEmb,
+                densePromptEmbeddings: nil,
+                highResS0: highResS0,
+                highResS1: highResS1
+            )
+            let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
+
+            times.append(elapsed)
+
+            if i == 0 {
+                lastMaskChecksum = result.masks.checksum()
+                lastIoUChecksum = result.iouPred.checksum()
+                print("  Mask checksum: \(lastMaskChecksum.prefix(16))...")
+                print("  IoU checksum:  \(lastIoUChecksum.prefix(16))...")
+                print("  First 4 mask values: \(result.masks.firstFloats(4))")
+                print("  IoU predictions: \(result.iouPred.firstFloats(4))")
+            }
+
+            // Verify determinism
+            XCTAssertEqual(result.masks.checksum(), lastMaskChecksum, "Non-deterministic masks at iteration \(i)")
+            XCTAssertEqual(result.iouPred.checksum(), lastIoUChecksum, "Non-deterministic IoU at iteration \(i)")
+        }
+
+        // Statistics
+        let avg = times.reduce(0, +) / Double(times.count)
+        let sorted = times.sorted()
+        let median = sorted[sorted.count / 2]
+        let min = sorted.first!
+        let max = sorted.last!
+
+        print("\n📊 MaskDecoder Results:")
+        print("  Average: \(String(format: "%.2f", avg)) ms")
+        print("  Median:  \(String(format: "%.2f", median)) ms")
+        print("  Min:     \(String(format: "%.2f", min)) ms")
+        print("  Max:     \(String(format: "%.2f", max)) ms")
+        print("  Target:  \(OptimizationBaseline.maskDecoderTarget) ms")
+
+        if avg <= OptimizationBaseline.maskDecoderTarget {
+            print("  ✅ TARGET MET")
+        } else {
+            print("  ⚠️ TARGET MISSED by \(String(format: "%.1f", avg - OptimizationBaseline.maskDecoderTarget)) ms")
+        }
+
+        XCTAssertLessThan(avg, OptimizationBaseline.maskDecoderRegression,
+                         "Performance regression: MaskDecoder exceeded \(OptimizationBaseline.maskDecoderRegression)ms")
+    }
+
+    // MARK: - TwoWayTransformer Baseline
+
+    func testTwoWayTransformerBaseline() throws {
+        print("\n" + String(repeating: "=", count: 60))
+        print("TwoWayTransformer Performance Baseline")
+        guard #available(macOS 15.0, *) else {
+            throw XCTSkip("Requires macOS 15.0+ (ViTEncoder/MPSGraph)")
+        }
+        print(String(repeating: "=", count: 60))
+
+        let transformer = TwoWayTransformer(device: device, depth: 2, embedDim: 256, numHeads: 8, mlpDim: 2048)
+
+        // Create test inputs
+        let imageEmb = createTestBuffer(count: 1 * 5184 * 256, seed: 42)
+        let imagePE = createTestBuffer(count: 1 * 5184 * 256, seed: 43)
+        let pointEmb = createTestBuffer(count: 1 * 5 * 256, seed: 44)  // 5 tokens (1 IoU + 4 mask)
+
+        // Warmup
+        print("Warmup...")
+        for _ in 0..<3 {
+            _ = try? transformer.forward(
+                imageEmbeddings: imageEmb,
+                imagePE: imagePE,
+                pointEmbeddings: pointEmb
+            )
+        }
+
+        // Benchmark
+        let iterations = 10
+        print("Benchmarking \(iterations) iterations...")
+
+        var times: [Double] = []
+        var lastPointChecksum: String = ""
+        var lastImageChecksum: String = ""
+
+        for i in 0..<iterations {
+            let start = CFAbsoluteTimeGetCurrent()
+            let result = try transformer.forward(
+                imageEmbeddings: imageEmb,
+                imagePE: imagePE,
+                pointEmbeddings: pointEmb
+            )
+            let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
+
+            times.append(elapsed)
+
+            if i == 0 {
+                lastPointChecksum = result.pointEmbeddings.checksum()
+                lastImageChecksum = result.imageEmbeddings.checksum()
+                print("  Point checksum: \(lastPointChecksum.prefix(16))...")
+                print("  Image checksum: \(lastImageChecksum.prefix(16))...")
+            }
+
+            XCTAssertEqual(result.pointEmbeddings.checksum(), lastPointChecksum, "Non-deterministic points at iteration \(i)")
+            XCTAssertEqual(result.imageEmbeddings.checksum(), lastImageChecksum, "Non-deterministic image at iteration \(i)")
+        }
+
+        let avg = times.reduce(0, +) / Double(times.count)
+        let sorted = times.sorted()
+        let median = sorted[sorted.count / 2]
+
+        print("\n📊 TwoWayTransformer Results:")
+        print("  Average: \(String(format: "%.2f", avg)) ms")
+        print("  Median:  \(String(format: "%.2f", median)) ms")
+        print("  Target:  \(OptimizationBaseline.twoWayTransformerTarget) ms")
+
+        if avg <= OptimizationBaseline.twoWayTransformerTarget {
+            print("  ✅ TARGET MET")
+        } else {
+            print("  ⚠️ TARGET MISSED by \(String(format: "%.1f", avg - OptimizationBaseline.twoWayTransformerTarget)) ms")
+        }
+
+        XCTAssertLessThan(avg, OptimizationBaseline.twoWayTransformerRegression,
+                         "Performance regression: TwoWayTransformer exceeded \(OptimizationBaseline.twoWayTransformerRegression)ms")
+    }
+
+    // MARK: - Graph Caching Verification
+
+    func testGraphCachingEffectiveness() throws {
+        print("\n" + String(repeating: "=", count: 60))
+        print("Graph Caching Effectiveness Test")
+        guard #available(macOS 15.0, *) else {
+            throw XCTSkip("Requires macOS 15.0+ (ViTEncoder/MPSGraph)")
+        }
+        print(String(repeating: "=", count: 60))
+
+        // Clear cache
+        CompiledGraphCache.shared.clear()
+
+        let encoder = try ViTEncoder(device: device, numBlocks: 24)
+        let inputTexture = createTestTexture(width: 1024, height: 1024, seed: 42)
+
+        // First run (cold cache)
+        var coldTimes: [Double] = []
+        for _ in 0..<3 {
+            CompiledGraphCache.shared.clear() // Force cold cache
+
+            let cmd = commandQueue.makeCommandBuffer()!
+            let start = CFAbsoluteTimeGetCurrent()
+            _ = encoder.forward(image: inputTexture, commandBuffer: cmd)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            coldTimes.append((CFAbsoluteTimeGetCurrent() - start) * 1000)
+        }
+
+        // Warm cache runs
+        var warmTimes: [Double] = []
+        for _ in 0..<5 {
+            let cmd = commandQueue.makeCommandBuffer()!
+            let start = CFAbsoluteTimeGetCurrent()
+            _ = encoder.forward(image: inputTexture, commandBuffer: cmd)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            warmTimes.append((CFAbsoluteTimeGetCurrent() - start) * 1000)
+        }
+
+        let coldAvg = coldTimes.reduce(0, +) / Double(coldTimes.count)
+        let warmAvg = warmTimes.reduce(0, +) / Double(warmTimes.count)
+        let improvement = ((coldAvg - warmAvg) / coldAvg) * 100
+
+        print("\n📊 Graph Caching Results:")
+        print("  Cold cache avg:  \(String(format: "%.2f", coldAvg)) ms")
+        print("  Warm cache avg:  \(String(format: "%.2f", warmAvg)) ms")
+        print("  Improvement:     \(String(format: "%.1f", improvement))%")
+
+        // Warm cache should be faster
+        XCTAssertLessThan(warmAvg, coldAvg, "Warm cache should be faster than cold cache")
+    }
+
+    // MARK: - Determinism Stress Test
+
+    func testDeterminismStress() throws {
+        print("\n" + String(repeating: "=", count: 60))
+        print("Determinism Stress Test (50 iterations)")
+        guard #available(macOS 15.0, *) else {
+            throw XCTSkip("Requires macOS 15.0+ (ViTEncoder/MPSGraph)")
+        }
+        print(String(repeating: "=", count: 60))
+
+        let encoder = try ViTEncoder(device: device, numBlocks: 24)
+        let inputTexture = createTestTexture(width: 1024, height: 1024, seed: 42)
+
+        // Get reference output
+        let refCmd = commandQueue.makeCommandBuffer()!
+        let refOutput = encoder.forward(image: inputTexture, commandBuffer: refCmd)
+        refCmd.commit()
+        refCmd.waitUntilCompleted()
+
+        let referenceChecksum = refOutput.checksum()
+        let referenceValues = refOutput.firstFloat16s(10)
+
+        print("Reference checksum: \(referenceChecksum.prefix(32))...")
+        print("Reference values:   \(referenceValues.prefix(5))")
+
+        // Run 50 iterations and verify all match
+        var mismatches = 0
+        for i in 0..<50 {
+            let cmd = commandQueue.makeCommandBuffer()!
+            let output = encoder.forward(image: inputTexture, commandBuffer: cmd)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+
+            let checksum = output.checksum()
+            if checksum != referenceChecksum {
+                mismatches += 1
+                print("  ❌ Mismatch at iteration \(i)")
+                print("     Expected: \(referenceChecksum.prefix(16))...")
+                print("     Got:      \(checksum.prefix(16))...")
+            }
+        }
+
+        print("\n📊 Determinism Results:")
+        print("  Total iterations: 50")
+        print("  Mismatches:       \(mismatches)")
+
+        XCTAssertEqual(mismatches, 0, "Found \(mismatches) non-deterministic outputs")
+
+        if mismatches == 0 {
+            print("  ✅ All outputs deterministic")
+        }
+    }
+
+    // MARK: - Memory Usage Test
+
+    func testMemoryUsage() throws {
+        print("\n" + String(repeating: "=", count: 60))
+        print("Memory Usage Test")
+        guard #available(macOS 15.0, *) else {
+            throw XCTSkip("Requires macOS 15.0+ (ViTEncoder/MPSGraph)")
+        }
+        print(String(repeating: "=", count: 60))
+
+        let encoder = try ViTEncoder(device: device, numBlocks: 24)
+        let inputTexture = createTestTexture(width: 1024, height: 1024, seed: 42)
+
+        // Get initial memory
+        let initialMem = device.currentAllocatedSize
+
+        // Run several iterations
+        for _ in 0..<10 {
+            let cmd = commandQueue.makeCommandBuffer()!
+            _ = encoder.forward(image: inputTexture, commandBuffer: cmd)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+        }
+
+        let afterMem = device.currentAllocatedSize
+        let memGrowth = Double(afterMem - initialMem) / 1024 / 1024
+
+        print("\n📊 Memory Usage:")
+        print("  Initial:  \(String(format: "%.1f", Double(initialMem) / 1024 / 1024)) MB")
+        print("  After 10: \(String(format: "%.1f", Double(afterMem) / 1024 / 1024)) MB")
+        print("  Growth:   \(String(format: "%.1f", memGrowth)) MB")
+
+        // Memory should not grow significantly (allow 100MB tolerance for caches)
+        XCTAssertLessThan(memGrowth, 100, "Excessive memory growth detected")
+    }
+
+    // MARK: - Helper Methods
+
+    private func createTestTexture(width: Int, height: Int, seed: UInt64) -> MTLTexture {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba16Float,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        desc.usage = [.shaderRead, .shaderWrite]
+        let texture = device.makeTexture(descriptor: desc)!
+
+        // Fill with deterministic data
+        var rng = RandomNumberGenerator64(seed: seed)
+        var data = [Float16](repeating: 0, count: width * height * 4)
+        for i in 0..<data.count {
+            data[i] = Float16(rng.nextFloat() * 2.0 - 1.0)
+        }
+
+        data.withUnsafeBytes { ptr in
+            texture.replace(
+                region: MTLRegionMake2D(0, 0, width, height),
+                mipmapLevel: 0,
+                withBytes: ptr.baseAddress!,
+                bytesPerRow: width * 4 * 2
+            )
+        }
+
+        return texture
+    }
+
+    private func createTestBuffer(count: Int, seed: UInt64) -> MTLBuffer {
+        var rng = RandomNumberGenerator64(seed: seed)
+        var data = [Float](repeating: 0, count: count)
+        for i in 0..<data.count {
+            data[i] = rng.nextFloat() * 2.0 - 1.0
+        }
+
+        return device.makeBuffer(bytes: data, length: count * 4, options: .storageModeShared)!
+    }
+}
+
+// MARK: - Deterministic RNG
+
+struct RandomNumberGenerator64 {
+    private var state: UInt64
+
+    init(seed: UInt64) {
+        self.state = seed
+    }
+
+    mutating func next() -> UInt64 {
+        // xorshift64
+        state ^= state << 13
+        state ^= state >> 7
+        state ^= state << 17
+        return state
+    }
+
+    mutating func nextFloat() -> Float {
+        return Float(next() & 0xFFFFFF) / Float(0xFFFFFF)
+    }
+}
+
+// MARK: - Full Pipeline Baseline (Optional - requires weights)
+
+@available(macOS 15.0, *)
+extension OptimizationBaselineTests {
+
+    func testFullPipelineBaseline() throws {
+        // Skip if weights not available
+        let weightsPath = "/Users/kwilliams/Projects/ordo_bak/Sensors/sam3_full_weights.npz"
+        guard #available(macOS 15.0, *) else {
+            throw XCTSkip("Requires macOS 15.0+ (ViTEncoder/MPSGraph)")
+        }
+        guard FileManager.default.fileExists(atPath: weightsPath) else {
+            print("⚠️ Skipping full pipeline test - weights not found at \(weightsPath)")
+            return
+        }
+
+        print("\n" + String(repeating: "=", count: 60))
+        print("Full Pipeline Performance Baseline (with real weights)")
+        print(String(repeating: "=", count: 60))
+
+        let predictor = SAM3Predictor(device: device)
+        try predictor.loadWeights(from: URL(fileURLWithPath: weightsPath))
+
+        let testImagePath = "/Users/kwilliams/Projects/ordo_bak/Sensors/research/sam3/assets/images/truck.jpg"
+        guard let texture = loadTestImage(at: testImagePath) else {
+            print("⚠️ Skipping - test image not found")
+            return
+        }
+
+        // Warmup
+        print("Warmup...")
+        for _ in 0..<2 {
+            try predictor.setImage(texture)
+        }
+
+        // Benchmark
+        let iterations = 5
+        var times: [Double] = []
+
+        for i in 0..<iterations {
+            let start = CFAbsoluteTimeGetCurrent()
+            try predictor.setImage(texture)
+            let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
+            times.append(elapsed)
+            print("  Iteration \(i + 1): \(String(format: "%.2f", elapsed)) ms")
+        }
+
+        let avg = times.reduce(0, +) / Double(times.count)
+
+        print("\n📊 Full Pipeline Results:")
+        print("  Average: \(String(format: "%.2f", avg)) ms")
+        print("  Target:  \(OptimizationBaseline.fullPipelineTarget) ms")
+
+        if avg <= OptimizationBaseline.fullPipelineTarget {
+            print("  ✅ TARGET MET")
+        } else {
+            print("  ⚠️ TARGET MISSED")
+        }
+    }
+
+    private func loadTestImage(at path: String) -> MTLTexture? {
+        guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+
+        let width = 1008
+        let height = 1008
+        let bytesPerRow = width * 4
+        var rawData = [UInt8](repeating: 0, count: height * bytesPerRow)
+
+        let context = CGContext(
+            data: &rawData,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        )
+        context?.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        let texture = device.makeTexture(descriptor: desc)!
+        texture.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0, withBytes: rawData, bytesPerRow: bytesPerRow)
+
+        return texture
+    }
+}

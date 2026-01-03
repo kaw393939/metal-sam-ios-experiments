@@ -1,0 +1,113 @@
+import XCTest
+import Metal
+import CoreGraphics
+@testable import Sam3Sensor
+
+@available(macOS 15.0, *)
+final class SimpleWeightLoadingTest: XCTestCase {
+    
+    var device: MTLDevice!
+    
+    override func setUp() {
+        super.setUp()
+        guard let dev = MTLCreateSystemDefaultDevice() else {
+            XCTFail("Metal not available")
+            return
+        }
+        device = dev
+    }
+    
+    // MARK: - Simple Weight Loading Test
+    
+    func testLoadWeightsOnly() throws {
+        let weightsPath = "/Users/kwilliams/Projects/Sam3/OrdoSAM3Sensor/Tests/Artifacts/sam3_weights.npz"
+        guard FileManager.default.fileExists(atPath: weightsPath) else {
+            throw XCTSkip("Weights not found")
+        }
+        
+        print("=== Starting Weight Load Test ===")
+        print("Weights path: \(weightsPath)")
+        
+        // Create predictor
+        let predictor = SAM3Predictor(device: device)
+        print("Predictor created")
+        
+        // Try to load weights with error handling
+        do {
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            try predictor.loadWeights(from: URL(fileURLWithPath: weightsPath))
+            let t1 = DispatchTime.now().uptimeNanoseconds
+            let loadTimeMs = Double(t1 - t0) / 1_000_000.0
+            
+            print("✅ Weights loaded successfully in \(loadTimeMs)ms")
+            XCTAssert(true, "Weights loaded")
+        } catch {
+            print("❌ Weight loading failed: \(error)")
+            print("Error details: \(String(describing: error))")
+            throw error
+        }
+    }
+    
+    // MARK: - Minimal Inference Test
+    
+    func testMinimalInference() throws {
+        let weightsPath = "/Users/kwilliams/Projects/Sam3/OrdoSAM3Sensor/Tests/Artifacts/sam3_weights.npz"
+        guard FileManager.default.fileExists(atPath: weightsPath) else {
+            throw XCTSkip("Weights not found")
+        }
+        
+        print("\n=== Starting Minimal Inference Test ===")
+        
+        let predictor = SAM3Predictor(device: device)
+        
+        // Load weights
+        print("Loading weights...")
+        try predictor.loadWeights(from: URL(fileURLWithPath: weightsPath))
+        print("✅ Weights loaded")
+        
+        // Create small test image (512x512 instead of 1008x1008)
+        print("Creating test image...")
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: 512,
+            height: 512,
+            mipmapped: false
+        )
+        descriptor.usage = [.shaderRead, .shaderWrite]
+        descriptor.storageMode = .shared
+        
+        guard let texture = device.makeTexture(descriptor: descriptor) else {
+            XCTFail("Failed to create texture")
+            return
+        }
+        
+        // Fill with simple pattern
+        var data = [UInt8](repeating: 128, count: 512 * 512 * 4)
+        texture.replace(region: MTLRegionMake2D(0, 0, 512, 512), mipmapLevel: 0, withBytes: &data, bytesPerRow: 512 * 4)
+        print("✅ Test image created")
+        
+        // Set image
+        print("Encoding image...")
+        do {
+            try predictor.setImage(texture)
+            print("✅ Image encoded")
+        } catch {
+            print("❌ Image encoding failed: \(error)")
+            throw error
+        }
+        
+        // Predict
+        print("Running prediction...")
+        do {
+            let result = try predictor.predict(points: [CGPoint(x: 256, y: 256)], labels: [1])
+            print("✅ Prediction complete")
+            print("IoU scores: \(result.iouScores)")
+            print("Max IoU: \(result.iouScores.max() ?? 0.0)")
+            
+            XCTAssertGreaterThan(result.iouScores.max() ?? 0.0, 0.0, "Should have non-zero IoU")
+        } catch {
+            print("❌ Prediction failed: \(error)")
+            throw error
+        }
+    }
+}

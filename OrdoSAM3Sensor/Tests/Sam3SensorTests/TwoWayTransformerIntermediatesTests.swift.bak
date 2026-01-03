@@ -1,0 +1,176 @@
+
+import XCTest
+import MetalPerformanceShadersGraph
+import MetalPerformanceShaders
+@testable import Sam3Sensor
+
+/// Test that compares TwoWayTransformer intermediate outputs against Python reference.
+@available(macOS 15.0, *)
+final class TwoWayTransformerIntermediatesTests: XCTestCase {
+    
+    func loadBin(_ path: String) throws -> [Float] {
+        let url = URL(fileURLWithPath: path)
+        let data = try Data(contentsOf: url)
+        return data.withUnsafeBytes {
+            Array(UnsafeBufferPointer(start: $0.bindMemory(to: Float.self).baseAddress!, count: data.count/4))
+        }
+    }
+    
+    func testBlock0Comparison() throws {
+        let root = "/Users/kwilliams/Projects/ordo/Sensors/"
+        
+        // Check if reference files exist
+        guard FileManager.default.fileExists(atPath: root + "debug_twt_block0_queries.bin") else {
+            print("Skipping: Reference binaries not found. Run Python generate_reference_intermediates.py first.")
+            return
+        }
+        
+        // Load Python reference
+        let refQueries = try loadBin(root + "debug_twt_block0_queries.bin")
+        let refKeys = try loadBin(root + "debug_twt_block0_keys.bin")
+        
+        print("Ref Block0 queries: count=\(refQueries.count), sum=\(refQueries.reduce(0,+))")
+        print("Ref Block0 keys: count=\(refKeys.count), sum=\(refKeys.reduce(0,+))")
+        
+        // Load inputs
+        let imgEmbedRaw = try loadBin(root + "debug_img_embed.bin")   // [1, 72, 72, 256] NHWC
+        let posEncRaw = try loadBin(root + "debug_pos_enc.bin")       // [1, 72, 72, 256] NHWC
+        let sparseRaw = try loadBin(root + "debug_sparse.bin")        // [1, 2, 256]
+        
+        // Need to also load iou_token and mask_tokens from weights
+        let weightsUrl = URL(fileURLWithPath: root + "sam3_full_weights.npz")
+        
+        guard let device = MTLCreateSystemDefaultDevice() else { fatalError() }
+        let predictor = SAM3Predictor(device: device)
+        try predictor.loadWeights(from: weightsUrl)
+        
+        // Extract token weights
+        guard let iouTokenBuf = predictor.maskDecoder.iouToken,
+              let maskTokensBuf = predictor.maskDecoder.maskTokens else {
+            XCTFail("Token weights not loaded")
+            return
+        }
+        
+        let iouTokenPtr = iouTokenBuf.contents().bindMemory(to: Float.self, capacity: 256)
+        let maskTokensPtr = maskTokensBuf.contents().bindMemory(to: Float.self, capacity: 1024)
+        
+        // Build tokens: [iou (1x256), masks (4x256), sparse (2x256)] = [7, 256]
+        var tokensFlat: [Float] = []
+        tokensFlat.append(contentsOf: UnsafeBufferPointer(start: iouTokenPtr, count: 256))
+        tokensFlat.append(contentsOf: UnsafeBufferPointer(start: maskTokensPtr, count: 1024))
+        tokensFlat.append(contentsOf: sparseRaw)
+        
+        print("Tokens: count=\(tokensFlat.count), sum=\(tokensFlat.reduce(0,+))")
+        
+        // Flatten img embed from NHWC [1, 72, 72, 256] to [1, 5184, 256]
+        // Already in row-major, so should be contiguous
+        print("ImgEmbed: count=\(imgEmbedRaw.count), expected=\(1*72*72*256)")
+        
+        // Run TwoWayTransformer single block
+        let transformer = predictor.maskDecoder.transformer
+        
+        // Debug: Check block0 weights
+        let block0sa = transformer.blocks[0].selfAttn
+        if let qp = block0sa.q_proj {
+            let ptr = qp.contents().bindMemory(to: Float.self, capacity: 10)
+            print("Block0 selfAttn q_proj first 5: \(Array(UnsafeBufferPointer(start: ptr, count: 5)))")
+        } else {
+            print("WARNING: block0 selfAttn q_proj is nil!")
+        }
+        
+        // Check norm1 weights
+        let norm1 = transformer.blocks[0].norm1
+        if let g = norm1.gamma {
+            let ptr = g.contents().bindMemory(to: Float.self, capacity: 10)
+            print("Block0 norm1 gamma first 5: \(Array(UnsafeBufferPointer(start: ptr, count: 5)))")
+        } else {
+            print("WARNING: block0 norm1 gamma is nil!")
+        }
+        
+        // Build a graph for just block 0
+        let graph = MPSGraph()
+        
+        let tokenCount = 7
+        let imgCount = 5184  // 72*72
+        let embedDim = 256
+        
+        let tokensT = graph.placeholder(shape: [1, NSNumber(value: tokenCount), NSNumber(value: embedDim)], dataType: .float32, name: "tokens")
+        let imgT = graph.placeholder(shape: [1, NSNumber(value: imgCount), NSNumber(value: embedDim)], dataType: .float32, name: "img")
+        let imgPeT = graph.placeholder(shape: [1, NSNumber(value: imgCount), NSNumber(value: embedDim)], dataType: .float32, name: "img_pe")
+        
+        // Run first block only
+        let block0 = transformer.blocks[0]
+        let (outQ, outK) = block0.buildGraph(
+            pointInput: tokensT,
+            imageInput: imgT,
+            pointPE: tokensT,  // PE is tokens themselves
+            imagePE: imgPeT,
+            graph: graph,
+            namePrefix: "test/b0"
+        )
+        
+        // Execute
+        guard let queue = device.makeCommandQueue(),
+              let cmd = queue.makeCommandBuffer() else { fatalError() }
+        let mpsCmd = MPSCommandBuffer(commandBuffer: cmd)
+        
+        let tokensBuf = device.makeBuffer(bytes: tokensFlat, length: tokensFlat.count * 4, options: .storageModeShared)!
+        let imgBuf = device.makeBuffer(bytes: imgEmbedRaw, length: imgEmbedRaw.count * 4, options: .storageModeShared)!
+        let imgPeBuf = device.makeBuffer(bytes: posEncRaw, length: posEncRaw.count * 4, options: .storageModeShared)!
+        
+        var feeds: [MPSGraphTensor: MPSGraphTensorData] = [
+            tokensT: MPSGraphTensorData(tokensBuf, shape: [1, NSNumber(value: tokenCount), NSNumber(value: embedDim)], dataType: .float32),
+            imgT: MPSGraphTensorData(imgBuf, shape: [1, NSNumber(value: imgCount), NSNumber(value: embedDim)], dataType: .float32),
+            imgPeT: MPSGraphTensorData(imgPeBuf, shape: [1, NSNumber(value: imgCount), NSNumber(value: embedDim)], dataType: .float32)
+        ]
+        
+        // Add block weights
+        block0.addFeeds(to: &feeds, namePrefix: "test/b0")
+        
+        // Use sync run instead of encode for simpler result extraction
+        let syncResults = graph.run(with: queue, feeds: feeds, targetTensors: [outQ, outK], targetOperations: nil)
+        
+        guard let qData = syncResults[outQ], let kData = syncResults[outK] else {
+            XCTFail("No results from graph.run")
+            return
+        }
+        
+        // Read results
+        let outQBuf = device.makeBuffer(length: tokenCount * embedDim * 4, options: .storageModeShared)!
+        let outKBuf = device.makeBuffer(length: imgCount * embedDim * 4, options: .storageModeShared)!
+        
+        qData.mpsndarray().readBytes(outQBuf.contents(), strideBytes: nil)
+        kData.mpsndarray().readBytes(outKBuf.contents(), strideBytes: nil)
+        
+        let metQPtr = outQBuf.contents().bindMemory(to: Float.self, capacity: tokenCount * embedDim)
+        let metKPtr = outKBuf.contents().bindMemory(to: Float.self, capacity: imgCount * embedDim)
+        
+        var metQSum: Float = 0
+        var metKSum: Float = 0
+        for i in 0..<(tokenCount * embedDim) { metQSum += metQPtr[i] }
+        for i in 0..<(imgCount * embedDim) { metKSum += metKPtr[i] }
+        
+        print("Metal Block0 queries sum: \(metQSum)")
+        print("Metal Block0 keys sum: \(metKSum)")
+        
+        let refQSum = refQueries.reduce(0,+)
+        let refKSum = refKeys.reduce(0,+)
+        
+        print("Python Block0 queries sum: \(refQSum)")  
+        print("Python Block0 keys sum: \(refKSum)")
+        
+        let qDiff = abs(metQSum - refQSum)
+        let kDiff = abs(metKSum - refKSum)
+        
+        print("Queries sum diff: \(qDiff)")
+        print("Keys sum diff: \(kDiff)")
+        
+        // Check first few values
+        print("\nFirst 10 query values:")
+        print("Python: \(Array(refQueries.prefix(10)))")
+        print("Metal:  \(Array(UnsafeBufferPointer(start: metQPtr, count: 10)))")
+        
+        XCTAssertLessThan(qDiff, 1.0, "Block0 queries diverged too much")
+        XCTAssertLessThan(kDiff, 1000.0, "Block0 keys diverged too much")
+    }
+}
